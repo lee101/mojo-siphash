@@ -17,8 +17,8 @@ variants are part of this port. The original module's internal
 Inputs may be `bytes`, `bytearray`, or a one-dimensional C-contiguous
 unsigned-byte buffer such as a `numpy.uint8` array. Other NumPy dtypes,
 multidimensional buffers, and strided buffers are rejected rather than being
-silently reinterpreted as bytes. Calls copy mutable inputs before entering the
-native library.
+silently reinterpreted as bytes. Aligned bulk input stays zero-copy across the
+native call; streaming retains a copy of only the final zero to seven bytes.
 
 ## Install
 
@@ -56,9 +56,9 @@ after adaptive batching. `upstream / Mojo` above 1 means Mojo is faster.
 
 | Function | Input | Mojo | upstream | upstream / Mojo |
 |---|---:|---:|---:|---:|
-| `SipHash_2_4.hash` | 64 bytes | 5.37 µs | 33.99 µs | 6.33x |
-| `SipHash_2_4.hash` | 4 KiB | 7.89 µs | 1537.11 µs | 194.86x |
-| `SipHash_2_4.hash` | 1 MiB | 626.18 µs | 392266.51 µs | 626.44x |
+| `SipHash_2_4.hash` | 64 bytes | 5.58 µs | 35.87 µs | 6.42x |
+| `SipHash_2_4.hash` | 4 KiB | 8.32 µs | 1611.20 µs | 193.73x |
+| `SipHash_2_4.hash` | 1 MiB | 647.00 µs | 395512.92 µs | 611.30x |
 
 These are direct final-run results. The comparison is intentionally against
 the target package's pure-Python implementation, not a native SipHash wheel.
@@ -66,9 +66,10 @@ the target package's pure-Python implementation, not a native SipHash wheel.
 SipHash compression is a dependency chain: each 8-byte block updates the
 state consumed by the next block. It therefore has no correct data-parallel
 inner loop to SIMD-vectorize or parallelize for a single hash. A GPU path is
-also inappropriate: one message provides only one dependent stream, so launch
-and transfer costs outweigh its small fixed per-block computation. The CPU
-implementation remains the default and only path.
+also inappropriate: its arithmetic intensity does not justify device transfer,
+and one message provides only one dependent stream, so launch and transfer
+costs outweigh its small fixed per-block computation. The CPU implementation
+remains the default and only path.
 
 ## How it works
 
@@ -78,10 +79,12 @@ finalization rounds. Python keeps the hashlib-style partial block plus native
 four-word state, passing their non-null addresses, byte lengths, and two
 little-endian key words through three small `ctypes` C ABI calls. Mojo
 reconstructs `UnsafePointer[UInt8, AnyOrigin[mut=True]]` and
-`UnsafePointer[UInt64, AnyOrigin[mut=True]]`; no per-byte Python hashing or
-whole-message buffering occurs. An allocated one-byte sentinel supplies the
-required non-null address for empty messages.
+`UnsafePointer[UInt64, AnyOrigin[mut=True]]`. Python exports contiguous buffer
+storage directly for each aligned bulk region and copies only a boundary block
+or the final partial block; no per-byte Python hashing or whole-message
+buffering occurs. An allocated one-byte sentinel supplies the required non-null
+address for empty messages.
 
 Tests compare all 64 published SipHash vectors, block boundaries, randomized
-large input, streaming state, copying, and byte-buffer input against the real
-PyPI `siphash` package.
+large input, streaming state, copying, byte-buffer input, and zero-copy NumPy
+bulk addresses against the real PyPI `siphash` package.

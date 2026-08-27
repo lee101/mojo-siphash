@@ -5,6 +5,7 @@ from __future__ import annotations
 import binascii
 import ctypes
 import struct
+from contextlib import contextmanager
 
 from ._lib import lib
 
@@ -20,13 +21,32 @@ _UPDATE = lib().msh_siphash24_update
 _FINALIZE = lib().msh_siphash24_finalize
 
 
-def _bytes(value, *, name: str) -> bytes:
-    """Return a stable byte copy of a supported input buffer.
+class _PyBuffer(ctypes.Structure):
+    _fields_ = [
+        ("buf", ctypes.c_void_p),
+        ("obj", ctypes.py_object),
+        ("len", ctypes.c_ssize_t),
+        ("itemsize", ctypes.c_ssize_t),
+        ("readonly", ctypes.c_int),
+        ("ndim", ctypes.c_int),
+        ("format", ctypes.c_char_p),
+        ("shape", ctypes.POINTER(ctypes.c_ssize_t)),
+        ("strides", ctypes.POINTER(ctypes.c_ssize_t)),
+        ("suboffsets", ctypes.POINTER(ctypes.c_ssize_t)),
+        ("internal", ctypes.c_void_p),
+    ]
 
-    The native ABI receives only this private ``bytes`` object, never a
-    caller-owned buffer.  That keeps its pointer valid for the full call and
-    avoids interpreting typed or strided buffers as a different byte stream.
-    """
+
+_GET_BUFFER = ctypes.pythonapi.PyObject_GetBuffer
+_GET_BUFFER.argtypes = [ctypes.py_object, ctypes.POINTER(_PyBuffer), ctypes.c_int]
+_GET_BUFFER.restype = ctypes.c_int
+_RELEASE_BUFFER = ctypes.pythonapi.PyBuffer_Release
+_RELEASE_BUFFER.argtypes = [ctypes.POINTER(_PyBuffer)]
+_RELEASE_BUFFER.restype = None
+
+
+def _buffer(value, *, name: str):
+    """Validate a byte buffer without copying its storage."""
     if isinstance(value, bytes):
         return value
     try:
@@ -37,14 +57,24 @@ def _bytes(value, *, name: str) -> bytes:
         raise TypeError(
             f"{name} must be a one-dimensional, C-contiguous unsigned-byte buffer"
         )
-    return view.tobytes()
+    return view
 
 
-def _address(data: bytes) -> int:
-    """Get a non-null address for a private bytes object held by the caller."""
+def _bytes_address(data: bytes, offset=0) -> int:
     if not data:
         return ctypes.addressof(_EMPTY)
-    return int(_BYTES_ADDRESS(data))
+    return int(_BYTES_ADDRESS(data)) + offset
+
+
+@contextmanager
+def _exported_address(data, offset=0):
+    """Hold a non-bytes buffer export while native code uses its address."""
+    exported = _PyBuffer()
+    _GET_BUFFER(data, ctypes.byref(exported), 0)
+    try:
+        yield int(exported.buf) + offset
+    finally:
+        _RELEASE_BUFFER(ctypes.byref(exported))
 
 
 class SipHash_2_4:
@@ -54,7 +84,7 @@ class SipHash_2_4:
     block_size = 64
 
     def __init__(self, secret, s=b""):
-        self._key0, self._key1 = _TWO_Q.unpack(_bytes(secret, name="secret"))
+        self._key0, self._key1 = _TWO_Q.unpack(_buffer(secret, name="secret"))
         self._state = (ctypes.c_uint64 * 4)()
         _INIT(ctypes.addressof(self._state), self._key0, self._key1)
         self.s = b""
@@ -62,20 +92,43 @@ class SipHash_2_4:
         self.update(s)
 
     def update(self, s):
-        # ``pending`` owns the storage passed to Mojo and remains live until
-        # the C call returns.  It also ensures that partial blocks are always
-        # byte-aligned, contiguous, and no more than seven bytes long.
-        pending = self.s + _bytes(s, name="s")
-        consumed = (len(pending) // 8) * 8
+        data = _buffer(s, name="s")
+        length = len(data)
+        offset = 0
+
+        if self.s:
+            needed = 8 - len(self.s)
+            if length < needed:
+                self.s += bytes(data)
+                return self
+            boundary = self.s + bytes(data[:needed])
+            _UPDATE(ctypes.addressof(self._state), _bytes_address(boundary), 8)
+            self.b += 8
+            self.s = b""
+            offset = needed
+
+        consumed = ((length - offset) // 8) * 8
         if consumed:
-            _UPDATE(ctypes.addressof(self._state), _address(pending), consumed)
-        self.b += consumed
-        self.s = pending[consumed:]
+            if isinstance(data, bytes):
+                _UPDATE(
+                    ctypes.addressof(self._state),
+                    _bytes_address(data, offset),
+                    consumed,
+                )
+            else:
+                with _exported_address(data, offset) as address:
+                    _UPDATE(ctypes.addressof(self._state), address, consumed)
+            self.b += consumed
+            offset += consumed
+        self.s = bytes(data[offset:])
         return self
 
     def hash(self):
         return int(_FINALIZE(
-            ctypes.addressof(self._state), _address(self.s), len(self.s), self.b + len(self.s)
+            ctypes.addressof(self._state),
+            _bytes_address(self.s),
+            len(self.s),
+            self.b + len(self.s),
         ))
 
     def digest(self):

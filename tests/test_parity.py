@@ -85,11 +85,38 @@ def test_bytearray_and_memoryview_input_are_accepted():
     assert siphash.siphash24(KEY, memoryview(data)).hash() == upstream.siphash24(KEY, memoryview(data)).hash()
 
 
-def test_uint8_numpy_buffers_are_copied_before_the_native_call():
-    data = np.arange(7, dtype=np.uint8)
+def test_uint8_numpy_bulk_is_zero_copy_and_tail_is_retained(monkeypatch):
+    data = np.arange(23, dtype=np.uint8)
     expected = siphash.siphash24(KEY, data.tobytes()).hash()
+    calls = []
+    native_update = siphash._UPDATE
+
+    def recording_update(state, address, length):
+        calls.append((address, length))
+        native_update(state, address, length)
+
+    monkeypatch.setattr(siphash, "_UPDATE", recording_update)
     value = siphash.siphash24(KEY)
     value.update(data)
+    assert calls == [(data.ctypes.data, 16)]
+    data[:] = 0
+    assert value.hash() == expected
+
+
+def test_numpy_buffer_offset_stays_zero_copy_across_partial_block(monkeypatch):
+    data = np.arange(16, dtype=np.uint8)
+    expected = siphash.siphash24(KEY, b"x" + data.tobytes()).hash()
+    calls = []
+    native_update = siphash._UPDATE
+
+    def recording_update(state, address, length):
+        calls.append((address, length))
+        native_update(state, address, length)
+
+    monkeypatch.setattr(siphash, "_UPDATE", recording_update)
+    value = siphash.siphash24(KEY, b"x")
+    value.update(data)
+    assert calls[1] == (data.ctypes.data + 7, 8)
     data[:] = 0
     assert value.hash() == expected
 
